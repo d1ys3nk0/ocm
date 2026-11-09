@@ -29,6 +29,13 @@ type routeRecord struct {
 	Destination, Gateway string
 }
 
+func (t Transport) networkCommand(ctx context.Context, path string, args ...string) (string, error) {
+	if t.command != nil {
+		return t.command(ctx, "", path, args...)
+	}
+	return systemCommand(ctx, "", path, args...)
+}
+
 func (t Transport) withNetworkLock(ctx context.Context, action func() error) error {
 	file, err := os.OpenFile(filepath.Join(t.Root, "network.lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
@@ -68,23 +75,23 @@ func (t Transport) restoreDNSLocked(ctx context.Context) error {
 		}
 		return fmt.Errorf("cannot read DNS ownership record: %w", err)
 	}
-	current, err := currentDNS(ctx, record.Service)
+	current, err := t.currentDNS(ctx, record.Service)
 	if err != nil {
 		return err
 	}
 	if len(current) == 1 && current[0] == record.Applied {
-		if err := setDNS(ctx, record.Service, record.Previous); err != nil {
+		if err := t.setDNS(ctx, record.Service, record.Previous); err != nil {
 			return err
 		}
 	}
 	return os.Remove(path)
 }
 
-func currentDNS(ctx context.Context, service string) ([]string, error) {
+func (t Transport) currentDNS(ctx context.Context, service string) ([]string, error) {
 	if service == "" || strings.HasPrefix(service, "-") {
 		return nil, fmt.Errorf("invalid physical network service")
 	}
-	text, err := systemCommand(ctx, "", "/usr/sbin/networksetup", "-getdnsservers", service)
+	text, err := t.networkCommand(ctx, "/usr/sbin/networksetup", "-getdnsservers", service)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read network service DNS: %w", err)
 	}
@@ -100,20 +107,25 @@ func currentDNS(ctx context.Context, service string) ([]string, error) {
 	return addresses, nil
 }
 
-func setDNS(ctx context.Context, service string, servers []string) error {
+func (t Transport) setDNS(ctx context.Context, service string, servers []string) error {
+	for _, server := range servers {
+		if _, err := netip.ParseAddr(server); err != nil {
+			return fmt.Errorf("invalid saved DNS address")
+		}
+	}
 	if len(servers) == 0 {
 		servers = []string{"empty"}
 	}
-	_, err := systemCommand(ctx, "", "/usr/sbin/networksetup", append([]string{"-setdnsservers", service}, servers...)...)
+	_, err := t.networkCommand(ctx, "/usr/sbin/networksetup", append([]string{"-setdnsservers", service}, servers...)...)
 	if err != nil {
 		return fmt.Errorf("cannot set network service DNS: %w", err)
 	}
 	return nil
 }
 
-func physicalService(ctx context.Context, gateway string) (string, error) {
+func (t Transport) physicalService(ctx context.Context, gateway string) (string, error) {
 	physical := func(destination string) string {
-		output, _ := systemCommand(ctx, "", "/sbin/route", "-n", "get", destination)
+		output, _ := t.networkCommand(ctx, "/sbin/route", "-n", "get", destination)
 		device := capture(devicePattern, output)
 		if strings.HasPrefix(device, "lo") || tunnelDevice.MatchString(device) {
 			return ""
@@ -124,7 +136,7 @@ func physicalService(ctx context.Context, gateway string) (string, error) {
 	if device == "" && gateway != "" {
 		device = physical(gateway)
 	}
-	services, err := systemCommand(ctx, "", "/usr/sbin/networksetup", "-listnetworkserviceorder")
+	services, err := t.networkCommand(ctx, "/usr/sbin/networksetup", "-listnetworkserviceorder")
 	if err != nil {
 		return "", err
 	}
@@ -148,14 +160,14 @@ func (t Transport) switchDNS(ctx context.Context, gateway string) error {
 	if _, err := netip.ParseAddr(server); err != nil {
 		return fmt.Errorf("invalid DNS setting")
 	}
-	service, err := physicalService(ctx, gateway)
+	service, err := t.physicalService(ctx, gateway)
 	if err != nil {
 		return err
 	}
 	if err := t.restoreDNSLocked(ctx); err != nil {
 		return err
 	}
-	current, err := currentDNS(ctx, service)
+	current, err := t.currentDNS(ctx, service)
 	if err != nil {
 		return err
 	}
@@ -165,7 +177,7 @@ func (t Transport) switchDNS(ctx context.Context, gateway string) error {
 	if err := writeJSON(filepath.Join(t.Root, "dns.json"), dnsRecord{service, current, server}); err != nil {
 		return err
 	}
-	return setDNS(ctx, service, []string{server})
+	return t.setDNS(ctx, service, []string{server})
 }
 
 func findRoute(table, destination string) (routeRecord, error) {
@@ -184,8 +196,8 @@ func findRoute(table, destination string) (routeRecord, error) {
 	return result, nil
 }
 
-func gatewayRoute(ctx context.Context, destination string) (routeRecord, error) {
-	output, err := systemCommand(ctx, "", "/usr/sbin/netstat", "-rn", "-f", "inet")
+func (t Transport) gatewayRoute(ctx context.Context, destination string) (routeRecord, error) {
+	output, err := t.networkCommand(ctx, "/usr/sbin/netstat", "-rn", "-f", "inet")
 	if err != nil {
 		return routeRecord{}, err
 	}
@@ -204,12 +216,12 @@ func (t Transport) forgetRoute(ctx context.Context) error {
 	if !ipv4(saved.Destination) || !ipv4(saved.Gateway) {
 		return fmt.Errorf("invalid route ownership record")
 	}
-	current, err := gatewayRoute(ctx, saved.Destination)
+	current, err := t.gatewayRoute(ctx, saved.Destination)
 	if err != nil {
 		return err
 	}
 	if current == saved {
-		if _, err := systemCommand(ctx, "", "/sbin/route", "-n", "delete", "-host", saved.Destination, saved.Gateway); err != nil {
+		if _, err := t.networkCommand(ctx, "/sbin/route", "-n", "delete", "-host", saved.Destination, saved.Gateway); err != nil {
 			return err
 		}
 	}
@@ -240,7 +252,7 @@ func (t Transport) hook(ctx context.Context) error {
 		}
 	}
 	if ipv4Gateway && (reason == "connect" || reason == "attempt-reconnect") {
-		current, err := gatewayRoute(ctx, gateway)
+		current, err := t.gatewayRoute(ctx, gateway)
 		if err != nil {
 			return err
 		}
@@ -276,7 +288,7 @@ func (t Transport) hook(ctx context.Context) error {
 		return t.restoreDNSLocked(ctx)
 	case "connect", "reconnect", "attempt-reconnect":
 		if ipv4Gateway {
-			current, err := gatewayRoute(ctx, gateway)
+			current, err := t.gatewayRoute(ctx, gateway)
 			if err != nil {
 				return err
 			}

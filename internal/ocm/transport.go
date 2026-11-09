@@ -15,6 +15,7 @@ import (
 
 type Transport struct {
 	Root, OpenConnect, VendorHook string
+	command                       func(context.Context, string, string, ...string) (string, error)
 }
 
 var errAuthentication = errors.New("VPN authentication failed")
@@ -166,7 +167,7 @@ func (t Transport) Run(ctx context.Context, profile Profile, status func(string)
 			if current == "" {
 				return fmt.Errorf("physical uplink unavailable")
 			}
-			if reconnecting.IsZero() && (awake || current != network || unhealthy) {
+			if reconnecting.IsZero() && reconnectNeeded(network, current, awake, unhealthy) {
 				network = current
 				if err := t.restoreDNS(ctx); err != nil {
 					return err
@@ -183,6 +184,10 @@ func (t Transport) Run(ctx context.Context, profile Profile, status func(string)
 			}
 		}
 	}
+}
+
+func reconnectNeeded(previous, current string, awake, unhealthy bool) bool {
+	return awake || previous != current || unhealthy
 }
 
 func logTail(path string) string {
