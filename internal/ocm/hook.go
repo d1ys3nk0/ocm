@@ -16,8 +16,6 @@ import (
 
 var tunnelDevice = regexp.MustCompile(`^(utun|tun)[0-9]+$`)
 var devicePattern = regexp.MustCompile(`(?m)^\s*interface:\s*(\S+)`)
-var serviceHeader = regexp.MustCompile(`^\([0-9]+\) (.+)$`)
-var serviceDevice = regexp.MustCompile(`Device: ([^),]+)`)
 
 type dnsRecord struct {
 	Service  string
@@ -67,6 +65,10 @@ func (t Transport) restoreDNS(ctx context.Context) error {
 }
 
 func (t Transport) restoreDNSLocked(ctx context.Context) error {
+	return errors.Join(t.removeResolvers(), t.restoreLegacyDNS(ctx))
+}
+
+func (t Transport) restoreLegacyDNS(ctx context.Context) error {
 	path := filepath.Join(t.Root, "dns.json")
 	var record dnsRecord
 	if err := readJSON(path, &record); err != nil {
@@ -121,63 +123,6 @@ func (t Transport) setDNS(ctx context.Context, service string, servers []string)
 		return fmt.Errorf("cannot set network service DNS: %w", err)
 	}
 	return nil
-}
-
-func (t Transport) physicalService(ctx context.Context, gateway string) (string, error) {
-	physical := func(destination string) string {
-		output, _ := t.networkCommand(ctx, "/sbin/route", "-n", "get", destination)
-		device := capture(devicePattern, output)
-		if strings.HasPrefix(device, "lo") || tunnelDevice.MatchString(device) {
-			return ""
-		}
-		return device
-	}
-	device := physical("default")
-	if device == "" && gateway != "" {
-		device = physical(gateway)
-	}
-	services, err := t.networkCommand(ctx, "/usr/sbin/networksetup", "-listnetworkserviceorder")
-	if err != nil {
-		return "", err
-	}
-	var service string
-	for _, line := range strings.Split(services, "\n") {
-		if name := capture(serviceHeader, line); name != "" {
-			service = name
-		}
-		if device != "" && capture(serviceDevice, line) == device && service != "" {
-			return service, nil
-		}
-	}
-	return "", fmt.Errorf("cannot identify physical network service")
-}
-
-func (t Transport) switchDNS(ctx context.Context, gateway string) error {
-	var server string
-	if err := readJSON(filepath.Join(t.Root, "dns-server.json"), &server); err != nil {
-		return fmt.Errorf("cannot read DNS setting: %w", err)
-	}
-	if _, err := netip.ParseAddr(server); err != nil {
-		return fmt.Errorf("invalid DNS setting")
-	}
-	service, err := t.physicalService(ctx, gateway)
-	if err != nil {
-		return err
-	}
-	if err := t.restoreDNSLocked(ctx); err != nil {
-		return err
-	}
-	current, err := t.currentDNS(ctx, service)
-	if err != nil {
-		return err
-	}
-	if len(current) == 1 && current[0] == server {
-		return nil
-	}
-	if err := writeJSON(filepath.Join(t.Root, "dns.json"), dnsRecord{service, current, server}); err != nil {
-		return err
-	}
-	return t.setDNS(ctx, service, []string{server})
 }
 
 func findRoute(table, destination string) (routeRecord, error) {
@@ -235,8 +180,17 @@ func (t Transport) Hook(ctx context.Context) error {
 	return t.withNetworkLock(ctx, func() error { return t.hook(ctx) })
 }
 
-func (t Transport) hook(ctx context.Context) error {
+func (t Transport) hook(ctx context.Context) (result error) {
 	reason, gateway := os.Getenv("reason"), os.Getenv("VPNGATEWAY")
+	switch reason {
+	case "disconnect", "attempt-reconnect":
+		defer func() { result = errors.Join(result, t.restoreDNSLocked(ctx)) }()
+	case "connect", "reconnect":
+		os.Remove(filepath.Join(t.Root, "tunnel"))
+		if err := t.restoreDNSLocked(ctx); err != nil {
+			return err
+		}
+	}
 	if gateway != "" {
 		if _, err := netip.ParseAddr(gateway); err != nil {
 			return fmt.Errorf("invalid VPN gateway")
@@ -284,8 +238,6 @@ func (t Transport) hook(ctx context.Context) error {
 		return fmt.Errorf("vendor VPN hook failed: %w", err)
 	}
 	switch reason {
-	case "disconnect":
-		return t.restoreDNSLocked(ctx)
 	case "connect", "reconnect", "attempt-reconnect":
 		if ipv4Gateway {
 			current, err := t.gatewayRoute(ctx, gateway)
@@ -308,10 +260,16 @@ func (t Transport) hook(ctx context.Context) error {
 			if !tunnelDevice.MatchString(device) {
 				return fmt.Errorf("invalid VPN tunnel device")
 			}
-			if err := t.switchDNS(ctx, gateway); err != nil {
+			policy, err := parseDNSPolicy(os.Getenv("OC_DNS_DOMAINS"), os.Getenv("OC_DNS_SERVER"))
+			if err != nil {
 				return err
 			}
-			return writeState(filepath.Join(t.Root, "tunnel"), []byte(device+"\n"))
+			if err := t.installResolvers(ctx, device, policy, os.Getenv("INTERNAL_IP4_DNS")+" "+os.Getenv("INTERNAL_IP6_DNS")); err != nil {
+				return err
+			}
+			if err := writeState(filepath.Join(t.Root, "tunnel"), []byte(device+"\n")); err != nil {
+				return errors.Join(err, t.removeResolvers())
+			}
 		}
 	}
 	return nil

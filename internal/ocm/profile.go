@@ -17,6 +17,7 @@ var certificate = regexp.MustCompile(`^[A-Za-z0-9:+=/.\-]+$`)
 type Profile struct {
 	password string
 	args     []string
+	dns      dnsPolicy
 }
 
 func LoadProfile(root, name, hook string) (Profile, error) {
@@ -107,5 +108,9 @@ func parseProfile(scanner *bufio.Scanner, hook string) (Profile, error) {
 		}
 		args = append(args, "--servercert="+pin)
 	}
-	return Profile{password: values["OC_PASS"], args: append(args, "--", host)}, nil
+	dns, err := parseDNSPolicy(values["OC_DNS_DOMAINS"], values["OC_DNS_SERVER"])
+	if err != nil {
+		return Profile{}, err
+	}
+	return Profile{password: values["OC_PASS"], args: append(args, "--", host), dns: dns}, nil
 }

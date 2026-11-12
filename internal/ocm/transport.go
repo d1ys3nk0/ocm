@@ -15,6 +15,7 @@ import (
 
 type Transport struct {
 	Root, OpenConnect, VendorHook string
+	resolverDir                   string
 	command                       func(context.Context, string, string, ...string) (string, error)
 }
 
@@ -85,7 +86,8 @@ func (t Transport) Run(ctx context.Context, profile Profile, status func(string)
 	}
 	defer log.Close()
 	cmd := exec.Command(t.OpenConnect, profile.args...)
-	cmd.Env = []string{systemPath, "LC_ALL=C", "HOME=/var/root"}
+	cmd.Env = []string{systemPath, "LC_ALL=C", "HOME=/var/root",
+		"OC_DNS_DOMAINS=" + strings.Join(profile.dns.domains, ","), "OC_DNS_SERVER=" + profile.dns.server}
 	cmd.Stdin = strings.NewReader(profile.password + "\n")
 	cmd.Stdout, cmd.Stderr = log, log
 	if err := ctx.Err(); err != nil {
