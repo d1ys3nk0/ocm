@@ -135,7 +135,7 @@ func hashBytes(data []byte) string { sum := sha256.Sum256(data); return hex.Enco
 
 func (i installation) binary() string     { return filepath.Join(i.packageDir, "bin", "ocm") }
 func (i installation) hook() string       { return filepath.Join(i.packageDir, "bin", "ocm-hook") }
-func (i installation) recordPath() string { return filepath.Join(i.packageDir, "install.json") }
+func (i installation) recordPath() string { return filepath.Join(i.dataDir, "install.json") }
 
 func (i installation) secure(path string, directory bool, mode fs.FileMode) error {
 	info, err := os.Lstat(path)
@@ -225,7 +225,7 @@ func (i installation) inspect() (installRecord, bool, error) {
 	for _, dir := range []struct {
 		path  string
 		names []string
-	}{{i.packageDir, []string{"bin", "install.json"}}, {filepath.Join(i.packageDir, "bin"), []string{"ocm", "ocm-hook"}}} {
+	}{{i.packageDir, []string{"bin"}}, {filepath.Join(i.packageDir, "bin"), []string{"ocm", "ocm-hook"}}} {
 		entries, err := os.ReadDir(dir.path)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
@@ -488,6 +488,17 @@ func (i installation) uninstall(ctx context.Context) error {
 	if !owned {
 		return nil
 	}
+	installed := false
+	for _, path := range []string{i.packageDir, i.command, i.plist} {
+		if _, err := os.Lstat(path); err == nil {
+			installed = true
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	if !installed {
+		return nil
+	}
 	if err = i.idle(); err != nil {
 		return err
 	}
@@ -508,7 +519,7 @@ func (i installation) uninstall(ctx context.Context) error {
 	if err = i.service(ctx, "stop", i.plist); err != nil {
 		return err
 	}
-	for _, path := range []string{i.command, i.hook(), i.binary(), i.plist, i.recordPath(), filepath.Join(i.packageDir, "bin"), i.packageDir} {
+	for _, path := range []string{i.command, i.hook(), i.binary(), i.plist, filepath.Join(i.packageDir, "bin"), i.packageDir} {
 		if err = os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
