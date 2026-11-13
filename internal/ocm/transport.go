@@ -25,8 +25,56 @@ var authError = regexp.MustCompile(`(?i)authentication failed|login failed|HTTP 
 var connectionError = regexp.MustCompile(`(?i)Dead Peer Detection detected dead peer|Can't assign requested address|Reconnect failed|Failed to reconnect|Session terminated|SSL connection failure|Script .+ returned error`)
 var established = regexp.MustCompile(`Configured as [0-9.]+|CSTP connected\.`)
 
+type childProcess interface {
+	Signal(os.Signal) error
+	Kill() error
+}
+
+func finishSession(process childProcess, done <-chan error, exited bool, grace, force time.Duration, cleanup func() error) error {
+	var signalErr error
+	if !exited {
+		select {
+		case <-done:
+			exited = true
+		default:
+		}
+		if !exited {
+			// The process handle belongs to the child we started; no PID is rediscovered.
+			if err := process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				signalErr = fmt.Errorf("cannot signal OpenConnect child: %w", err)
+			} else {
+				exited = waitForChild(done, grace)
+			}
+		}
+		if !exited {
+			if err := process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				signalErr = errors.Join(signalErr, fmt.Errorf("cannot kill OpenConnect child: %w", err))
+			}
+			exited = waitForChild(done, force)
+		}
+	}
+	if !exited {
+		return errors.Join(errRecovery, errors.New("OpenConnect child exit was not confirmed"), signalErr)
+	}
+	if err := cleanup(); err != nil {
+		return errors.Join(signalErr, fmt.Errorf("%w: %v", errRecovery, err))
+	}
+	return signalErr
+}
+
+func waitForChild(done <-chan error, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
 func (t Transport) existing(ctx context.Context) (bool, error) {
-	output, err := systemCommand(ctx, "", "/usr/bin/pgrep", "-x", "openconnect")
+	output, err := t.networkCommand(ctx, "/usr/bin/pgrep", "-x", "openconnect")
 	if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
 		return false, nil
 	}
@@ -101,23 +149,15 @@ func (t Transport) Run(ctx context.Context, profile Profile, status func(string)
 	go func() { done <- cmd.Wait() }()
 	exited := false
 	defer func() {
-		if !exited {
-			// Signal the owned child handle, never a persisted or rediscovered PID.
-			cmd.Process.Signal(syscall.SIGTERM)
-			timer := time.NewTimer(12 * time.Second)
-			select {
-			case <-done:
-			case <-timer.C:
-				cmd.Process.Kill()
-				<-done
-			}
-			timer.Stop()
+		finishErr := finishSession(cmd.Process, done, exited, 12*time.Second, 5*time.Second, func() error {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			return t.cleanup(cleanupCtx)
+		})
+		if finishErr != nil && !errors.Is(finishErr, errRecovery) {
+			fmt.Fprintln(os.Stderr, "ocm:", finishErr)
 		}
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		if err := t.cleanup(cleanupCtx); err != nil {
-			result = errors.Join(result, fmt.Errorf("%w: %v", errRecovery, err))
-		}
+		result = errors.Join(result, finishErr)
 	}()
 	started := time.Now()
 	lastSample := started
