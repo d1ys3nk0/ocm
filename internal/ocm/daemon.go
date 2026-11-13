@@ -26,6 +26,47 @@ type Status struct {
 	Error        string `json:"error,omitempty"`
 }
 
+func (s Status) MarshalJSON() ([]byte, error) {
+	state := "stopped"
+	switch s.State {
+	case "waiting-network", "connecting":
+		state = "starting"
+	case "connected":
+		state = "running"
+	case "reconnecting", "profile-unavailable":
+		state = "recovering"
+	case "failed", "authentication-required":
+		state = "failed"
+	case "stopping":
+		state = "stopping"
+	}
+	mode := ""
+	if s.SavedProfile != "" {
+		mode = "background"
+	} else if s.Profile != "" && state != "stopped" {
+		mode = "foreground"
+	}
+	message := s.Error
+	health := "unknown"
+	if state == "failed" {
+		health = "unhealthy"
+	}
+	if message == "" && s.State == "authentication-required" {
+		message = "authentication required"
+	} else if message == "" && s.State == "failed" {
+		message = "session failed; check private logs"
+	}
+	return json.Marshal(struct {
+		State          string            `json:"state"`
+		Mode           string            `json:"mode"`
+		Profile        string            `json:"profile"`
+		DesiredProfile string            `json:"desired_profile"`
+		Health         string            `json:"health"`
+		Error          string            `json:"error"`
+		Details        map[string]string `json:"details"`
+	}{state, mode, s.Profile, s.SavedProfile, health, message, map[string]string{"stage": s.State}})
+}
+
 type runner func(context.Context, Profile, func(string)) error
 
 type daemon struct {
@@ -38,6 +79,8 @@ type daemon struct {
 	status     Status
 	cancel     context.CancelFunc
 	done       chan struct{}
+	session    *os.File
+	foreground bool
 }
 
 func (d *daemon) loadProfile(name string) (Profile, error) {
@@ -57,18 +100,29 @@ func (d *daemon) setState(state string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.status.State = state
+	if state == "connecting" {
+		d.status.Error = ""
+	}
 }
 
-func (d *daemon) stopWorker() {
+func (d *daemon) stopWorker() error {
 	if d.cancel != nil {
 		d.cancel()
 		<-d.done
 		d.cancel = nil
+		d.mu.Lock()
+		failed := d.status.Error == "network recovery failed; check private logs"
+		d.mu.Unlock()
+		if failed {
+			return errors.New("network recovery failed; check private logs")
+		}
 	}
 	d.mu.Lock()
 	d.status.Profile = ""
 	d.status.State = "stopped"
+	d.status.Error = ""
 	d.mu.Unlock()
+	return nil
 }
 
 func (d *daemon) launch(name string, persistent bool) <-chan struct{} {
@@ -79,8 +133,13 @@ func (d *daemon) launch(name string, persistent bool) <-chan struct{} {
 	d.status.Profile = name
 	d.status.State = "waiting-network"
 	d.mu.Unlock()
+	session := d.session
+	d.session = nil
 	go func() {
 		defer close(done)
+		if session != nil {
+			defer session.Close()
+		}
 		delay := 5 * time.Second
 		for ctx.Err() == nil {
 			profile, err := d.loadProfile(name)
@@ -99,7 +158,15 @@ func (d *daemon) launch(name string, persistent bool) <-chan struct{} {
 				d.setState(state)
 			})
 			if ctx.Err() != nil {
-				d.setState("stopped")
+				if errors.Is(err, errRecovery) {
+					d.mu.Lock()
+					d.status.State = "failed"
+					d.status.Error = "network recovery failed; check private logs"
+					d.mu.Unlock()
+					fmt.Fprintln(os.Stderr, "ocm:", err)
+				} else {
+					d.setState("stopped")
+				}
 				return
 			}
 			if errors.Is(err, errAuthentication) {
@@ -109,7 +176,12 @@ func (d *daemon) launch(name string, persistent bool) <-chan struct{} {
 			if err == nil {
 				d.setState("stopped")
 			} else {
-				d.setState("failed")
+				d.mu.Lock()
+				d.status.State = "failed"
+				if errors.Is(err, errRecovery) {
+					d.status.Error = "network recovery failed; check private logs"
+				}
+				d.mu.Unlock()
 				fmt.Fprintln(os.Stderr, "ocm:", err)
 			}
 			if !persistent || !pause(ctx, delay) {
@@ -131,17 +203,23 @@ func (d *daemon) handle(req Request) (Status, <-chan struct{}, error) {
 		return Status{}, nil, d.ctx.Err()
 	}
 	current := d.snapshot()
+	if d.foreground && (req.Action == "start" || req.Action == "toggle" && (current.Profile == "" || current.State == "stopped" || current.State == "failed" || current.State == "authentication-required")) {
+		return Status{}, nil, fmt.Errorf("foreground session is ending; retry the command")
+	}
 	switch req.Action {
 	case "toggle":
 		if !profileName.MatchString(req.Profile) {
 			return Status{}, nil, fmt.Errorf("invalid profile name")
 		}
 		if current.SavedProfile != "" || (current.Profile != "" && current.State != "stopped" && current.State != "failed" && current.State != "authentication-required") {
+			if current.SavedProfile != "" && current.SavedProfile != req.Profile || current.Profile != "" && current.Profile != req.Profile {
+				return Status{}, nil, fmt.Errorf("stop the existing session before changing profiles")
+			}
 			req.Action = "stop"
 		} else {
 			req.Action = "start"
 		}
-	case "start", "stop", "connect":
+	case "start", "stop", "run":
 	default:
 		return Status{}, nil, fmt.Errorf("unsupported command")
 	}
@@ -150,25 +228,54 @@ func (d *daemon) handle(req Request) (Status, <-chan struct{}, error) {
 			return Status{}, nil, err
 		}
 	}
-	if req.Action == "connect" && (current.SavedProfile != "" || (current.Profile != "" && current.State != "stopped" && current.State != "failed" && current.State != "authentication-required")) {
-		return Status{}, nil, fmt.Errorf("stop the existing session before foreground connect")
+	if req.Action == "run" && (current.SavedProfile != "" || (current.Profile != "" && current.State != "stopped" && current.State != "failed" && current.State != "authentication-required")) {
+		return Status{}, nil, fmt.Errorf("stop the existing session before foreground run")
 	}
-	if req.Action == "start" && current.SavedProfile == req.Profile && current.State == "connected" {
-		return current, nil, nil
+	if req.Action == "start" {
+		if current.SavedProfile != "" && current.SavedProfile != req.Profile || current.Profile != "" && current.Profile != req.Profile && current.State != "stopped" {
+			return Status{}, nil, fmt.Errorf("stop the existing session before changing profiles")
+		}
+		if current.SavedProfile == req.Profile && current.State != "failed" && current.State != "authentication-required" && current.State != "stopped" {
+			return current, nil, nil
+		}
+		if current.SavedProfile == "" && current.Profile != "" && current.State != "stopped" && current.State != "failed" && current.State != "authentication-required" {
+			return Status{}, nil, fmt.Errorf("stop the foreground session before starting in the background")
+		}
 	}
-	if req.Action != "connect" {
+	if req.Action == "start" || req.Action == "run" {
+		// A finished worker can still have a cancel function until it is reaped.
+		if err := d.stopWorker(); err != nil {
+			return Status{}, nil, err
+		}
+		session, err := lockSession(d.ctx, d.root)
+		if err != nil {
+			return Status{}, nil, err
+		}
+		d.session = session
+	}
+	if req.Action != "run" {
 		saved := ""
 		if req.Action == "start" {
 			saved = req.Profile
 		}
 		if err := writeJSON(filepath.Join(d.root, "desired.json"), intent{Profile: saved}); err != nil {
+			if d.session != nil {
+				d.session.Close()
+				d.session = nil
+			}
 			return Status{}, nil, fmt.Errorf("cannot save connection state")
 		}
 		d.mu.Lock()
 		d.status.SavedProfile = saved
 		d.mu.Unlock()
 	}
-	d.stopWorker()
+	if err := d.stopWorker(); err != nil {
+		if d.session != nil {
+			d.session.Close()
+			d.session = nil
+		}
+		return Status{}, nil, err
+	}
 	if req.Action == "stop" {
 		return d.snapshot(), nil, nil
 	}
@@ -183,33 +290,16 @@ func (d *daemon) serve(conn net.Conn) {
 	if err := json.NewDecoder(io.LimitReader(conn, 4096)).Decode(&req); err != nil {
 		return
 	}
+	if req.Action == "run" {
+		_ = json.NewEncoder(conn).Encode(Status{Error: "run must execute in the foreground"})
+		return
+	}
 	conn.SetReadDeadline(time.Time{})
-	status, done, err := d.handle(req)
+	status, _, err := d.handle(req)
 	if err != nil {
 		status.Error = err.Error()
 	}
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(status); req.Action != "connect" || done == nil {
-		return
-	} else if err == nil {
-		closed := make(chan struct{})
-		go func() {
-			var buf [1]byte
-			conn.Read(buf[:])
-			close(closed)
-		}()
-		select {
-		case <-done:
-			encoder.Encode(d.snapshot())
-			return
-		case <-closed:
-		}
-	}
-	d.control.Lock()
-	defer d.control.Unlock()
-	if done == d.done {
-		d.stopWorker()
-	}
+	_ = json.NewEncoder(conn).Encode(status)
 }
 
 func Serve(ctx context.Context, root, hook string, transport Transport) error {
@@ -227,28 +317,47 @@ func Serve(ctx context.Context, root, hook string, transport Transport) error {
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return fmt.Errorf("another OCM daemon owns this state: %w", err)
 	}
+	control, err := LockControl(ctx, root)
+	if err != nil {
+		return err
+	}
 	saved, err := readIntent(root)
 	if err != nil {
+		control.Close()
 		return err
 	}
 	socket := filepath.Join(root, "control.sock")
 	if err := os.Remove(socket); err != nil && !os.IsNotExist(err) {
+		control.Close()
 		return err
 	}
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
+		control.Close()
 		return err
 	}
 	defer listener.Close()
 	if err := os.Chmod(socket, 0600); err != nil {
+		control.Close()
 		return err
 	}
 	d := daemon{ctx: ctx, root: root, hook: hook, run: transport.Run, status: Status{State: "stopped", SavedProfile: saved}}
 	if saved != "" {
+		d.session, err = lockSession(ctx, root)
+		if err != nil {
+			control.Close()
+			return err
+		}
 		d.launch(saved, true)
-	} else if err := transport.cleanup(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "ocm: could not clean stale network state:", err)
+	} else if session, err := lockSession(ctx, root); err == nil {
+		if err := transport.cleanup(ctx); err != nil {
+			fmt.Fprintln(os.Stderr, "ocm: could not clean stale network state:", err)
+			d.status.State = "failed"
+			d.status.Error = "network recovery failed; check private logs"
+		}
+		session.Close()
 	}
+	control.Close()
 	go func() {
 		<-ctx.Done()
 		listener.Close()
@@ -265,6 +374,82 @@ func Serve(ctx context.Context, root, hook string, transport Transport) error {
 			return err
 		}
 		go d.serve(conn)
+	}
+}
+
+// Foreground runs a session in this process. The caller holds the control lock
+// until ready receives a result, preventing commands from missing the socket.
+func Foreground(ctx context.Context, root, hook, name string, transport Transport, ready chan<- error) error {
+	if err := CheckRoot(root); err != nil {
+		ready <- err
+		return err
+	}
+	if err := CheckRoot(filepath.Join(root, "profiles")); err != nil {
+		ready <- err
+		return err
+	}
+	d := &daemon{ctx: ctx, root: root, hook: hook, run: transport.Run, status: Status{State: "stopped"}, foreground: true}
+	return foregroundSession(ctx, d, name, ready)
+}
+
+func foregroundSession(ctx context.Context, d *daemon, name string, ready chan<- error) error {
+	root := d.root
+	saved, err := readIntent(root)
+	if err != nil {
+		ready <- err
+		return err
+	}
+	if saved != "" {
+		err = fmt.Errorf("stop the background session before foreground run")
+		ready <- err
+		return err
+	}
+	_, done, err := d.handle(Request{Action: "run", Profile: name})
+	if err != nil {
+		ready <- err
+		return err
+	}
+	socket := filepath.Join(root, "foreground.sock")
+	if err = os.Remove(socket); err != nil && !os.IsNotExist(err) {
+		d.stopWorker()
+		ready <- err
+		return err
+	}
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		d.stopWorker()
+		ready <- err
+		return err
+	}
+	defer listener.Close()
+	defer os.Remove(socket)
+	if err := os.Chmod(socket, 0600); err != nil {
+		d.stopWorker()
+		ready <- err
+		return err
+	}
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go d.serve(conn)
+		}
+	}()
+	ready <- nil
+	select {
+	case <-ctx.Done():
+		d.control.Lock()
+		d.stopWorker()
+		d.control.Unlock()
+		return ctx.Err()
+	case <-done:
+		switch d.snapshot().State {
+		case "failed", "authentication-required", "profile-unavailable":
+			return fmt.Errorf("foreground session failed; check private logs")
+		}
+		return nil
 	}
 }
 

@@ -11,8 +11,10 @@ import (
 	"strings"
 )
 
-var profileName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+var profileName = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_-]*$`)
 var certificate = regexp.MustCompile(`^[A-Za-z0-9:+=/.\-]+$`)
+
+func ValidProfileName(name string) bool { return profileName.MatchString(name) }
 
 type Profile struct {
 	password string
@@ -35,6 +37,23 @@ func LoadProfile(root, name, hook string) (Profile, error) {
 	}
 	defer file.Close()
 	return parseProfile(bufio.NewScanner(file), hook)
+}
+
+func Profiles(root string) ([]string, error) {
+	if err := CheckRoot(filepath.Join(root, "profiles")); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "profiles"))
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if profileName.MatchString(entry.Name()) && entry.Type().IsRegular() {
+			names = append(names, entry.Name())
+		}
+	}
+	return names, nil
 }
 
 func parseProfile(scanner *bufio.Scanner, hook string) (Profile, error) {

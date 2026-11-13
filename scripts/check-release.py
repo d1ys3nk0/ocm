@@ -52,6 +52,9 @@ def main():
                 raise ValueError(f"Unexpected archive contents: {archive.name}")
             if not all(m.isfile() and m.size > 0 for m in members):
                 raise ValueError(f"Expected nonempty regular files: {archive.name}")
+            for member in members:
+                if bytes.fromhex("61706578706c616e65") in contents.extractfile(member).read().lower():
+                    raise ValueError(f"Obsolete branding in {archive.name}: {member.name}")
             executable = contents.getmember("ocm")
             if not executable.mode & 0o111:
                 raise ValueError(f"Nonexecutable ocm: {archive.name}")

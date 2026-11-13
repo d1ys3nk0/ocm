@@ -20,6 +20,7 @@ type Transport struct {
 }
 
 var errAuthentication = errors.New("VPN authentication failed")
+var errRecovery = errors.New("network recovery failed")
 var authError = regexp.MustCompile(`(?i)authentication failed|login failed|HTTP response HTTP/[^ ]+ 401`)
 var connectionError = regexp.MustCompile(`(?i)Dead Peer Detection detected dead peer|Can't assign requested address|Reconnect failed|Failed to reconnect|Session terminated|SSL connection failure|Script .+ returned error`)
 var established = regexp.MustCompile(`Configured as [0-9.]+|CSTP connected\.`)
@@ -72,7 +73,7 @@ func (t Transport) Run(ctx context.Context, profile Profile, status func(string)
 		return err
 	}
 	if err := t.cleanup(ctx); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errRecovery, err)
 	}
 	os.Remove(filepath.Join(t.Root, "tunnel"))
 	status("connecting")
@@ -114,7 +115,9 @@ func (t Transport) Run(ctx context.Context, profile Profile, status func(string)
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		result = errors.Join(result, t.cleanup(cleanupCtx))
+		if err := t.cleanup(cleanupCtx); err != nil {
+			result = errors.Join(result, fmt.Errorf("%w: %v", errRecovery, err))
+		}
 	}()
 	started := time.Now()
 	lastSample := started
