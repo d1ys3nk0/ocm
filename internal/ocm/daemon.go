@@ -12,6 +12,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/d1ys3nk0/ocm/internal/desktopnotify"
 )
 
 type Request struct {
@@ -74,6 +76,7 @@ type daemon struct {
 	root, hook string
 	run        runner
 	load       func(string) (Profile, error)
+	notify     func(string)
 	control    sync.Mutex
 	mu         sync.Mutex
 	status     Status
@@ -140,6 +143,23 @@ func (d *daemon) launch(name string, persistent bool) <-chan struct{} {
 		if session != nil {
 			defer session.Close()
 		}
+		var connected, wasConnected, cleanupFailed bool
+		notify := func(event string) {
+			if d.notify != nil {
+				d.notify(event + " · " + name)
+			}
+		}
+		lost := func() {
+			if connected {
+				connected = false
+				notify("Connection lost")
+			}
+		}
+		defer func() {
+			if ctx.Err() != nil && wasConnected && !cleanupFailed {
+				notify("Disconnected")
+			}
+		}()
 		delay := 5 * time.Second
 		for ctx.Err() == nil {
 			profile, err := d.loadProfile(name)
@@ -152,13 +172,28 @@ func (d *daemon) launch(name string, persistent bool) <-chan struct{} {
 				continue
 			}
 			err = d.run(ctx, profile, func(state string) {
+				d.setState(state)
+				if ctx.Err() != nil {
+					return
+				}
 				if state == "connected" {
 					delay = 5 * time.Second
+					if !connected {
+						if wasConnected {
+							notify("Connection recovered")
+						} else {
+							notify("Connected")
+						}
+						connected, wasConnected = true, true
+					}
+				} else if state == "reconnecting" {
+					lost()
 				}
-				d.setState(state)
 			})
+			cleanupFailed = errors.Is(err, errRecovery)
 			if ctx.Err() != nil {
-				if errors.Is(err, errRecovery) {
+				if cleanupFailed {
+					lost()
 					d.mu.Lock()
 					d.status.State = "failed"
 					d.status.Error = "network recovery failed; check private logs"
@@ -169,6 +204,7 @@ func (d *daemon) launch(name string, persistent bool) <-chan struct{} {
 				}
 				return
 			}
+			lost()
 			if errors.Is(err, errAuthentication) {
 				d.setState("authentication-required")
 				return
@@ -341,7 +377,9 @@ func Serve(ctx context.Context, root, hook string, transport Transport) error {
 		control.Close()
 		return err
 	}
-	d := daemon{ctx: ctx, root: root, hook: hook, run: transport.Run, status: Status{State: "stopped", SavedProfile: saved}}
+	notifications := desktopnotify.New("OCM")
+	defer notifications.Close()
+	d := daemon{ctx: ctx, root: root, hook: hook, run: transport.Run, notify: notifications.Notify, status: Status{State: "stopped", SavedProfile: saved}}
 	if saved != "" {
 		d.session, err = lockSession(ctx, root)
 		if err != nil {
@@ -388,7 +426,9 @@ func Foreground(ctx context.Context, root, hook, name string, transport Transpor
 		ready <- err
 		return err
 	}
-	d := &daemon{ctx: ctx, root: root, hook: hook, run: transport.Run, status: Status{State: "stopped"}, foreground: true}
+	notifications := desktopnotify.New("OCM")
+	defer notifications.Close()
+	d := &daemon{ctx: ctx, root: root, hook: hook, run: transport.Run, notify: notifications.Notify, status: Status{State: "stopped"}, foreground: true}
 	return foregroundSession(ctx, d, name, ready)
 }
 

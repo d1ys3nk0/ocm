@@ -9,8 +9,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -182,10 +184,16 @@ func TestForegroundSocketAndExclusiveSession(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			started := make(chan struct{})
+			var alerts []string
 			d := &daemon{
 				ctx: ctx, root: root, foreground: true, status: Status{State: "stopped"},
-				load: func(string) (Profile, error) { return Profile{}, nil },
+				notify: func(body string) { alerts = append(alerts, body) },
+				load:   func(string) (Profile, error) { return Profile{}, nil },
 				run: func(ctx context.Context, _ Profile, state func(string)) error {
+					state("connected")
+					state("connected")
+					state("reconnecting")
+					state("reconnecting")
 					state("connected")
 					close(started)
 					<-ctx.Done()
@@ -232,6 +240,15 @@ func TestForegroundSocketAndExclusiveSession(t *testing.T) {
 				}
 			case <-time.After(time.Second):
 				t.Fatal("foreground did not exit")
+			}
+			want := []string{
+				"Connected · office",
+				"Connection lost · office",
+				"Connection recovered · office",
+				"Disconnected · office",
+			}
+			if !slices.Equal(alerts, want) {
+				t.Fatalf("alerts = %q, want %q", alerts, want)
 			}
 			if saved, err := readIntent(root); err != nil || saved != "" {
 				t.Fatalf("foreground persisted intent: %q, %v", saved, err)
@@ -342,4 +359,68 @@ func TestProfileNamesExcludeFlagLikeNames(t *testing.T) {
 			t.Errorf("accepted invalid profile %q", name)
 		}
 	}
+}
+
+func TestBackgroundNotificationsAcrossAutomaticRetry(t *testing.T) {
+	root := t.TempDir()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		alerts := make(chan string, 16)
+		attempts := 0
+		d := &daemon{
+			ctx: ctx, root: root, status: Status{State: "stopped"},
+			load:   func(string) (Profile, error) { return Profile{}, nil },
+			notify: func(body string) { alerts <- body },
+			run: func(ctx context.Context, _ Profile, state func(string)) error {
+				attempts++
+				if attempts == 1 {
+					state("connected")
+					return errors.New("unexpected exit")
+				}
+				if attempts == 2 {
+					return errors.New("still unavailable")
+				}
+				state("connected")
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		}
+		expect := func(want string) {
+			t.Helper()
+			select {
+			case got := <-alerts:
+				if got != want {
+					t.Fatalf("alert = %q, want %q", got, want)
+				}
+			case <-time.After(20 * time.Second):
+				t.Fatalf("missing alert %q", want)
+			}
+		}
+		if _, _, err := d.handle(Request{Action: "start", Profile: "office"}); err != nil {
+			t.Fatal(err)
+		}
+		expect("Connected · office")
+		expect("Connection lost · office")
+		expect("Connection recovered · office")
+		if _, _, err := d.handle(Request{Action: "stop"}); err != nil {
+			t.Fatal(err)
+		}
+		expect("Disconnected · office")
+
+		if _, _, err := d.handle(Request{Action: "start", Profile: "lab"}); err != nil {
+			t.Fatal(err)
+		}
+		expect("Connected · lab")
+		if _, _, err := d.handle(Request{Action: "stop"}); err != nil {
+			t.Fatal(err)
+		}
+		expect("Disconnected · lab")
+
+		select {
+		case got := <-alerts:
+			t.Fatalf("unexpected alert %q", got)
+		default:
+		}
+	})
 }

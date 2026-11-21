@@ -45,6 +45,12 @@ sudo ocm run office
 
 This interface replaces `connect NAME` with `run NAME` and the old `NAME start` ordering with `start NAME`. Existing installations require a deliberate profile and service migration; do not copy transient process IDs, sockets or locks.
 
+## macOS notifications
+
+OCM posts macOS notifications when a tunnel connects, loses its connection, recovers, or disconnects. Each notification names the active profile. Connecting a different profile after stopping produces a disconnect for the old profile and a connect for the new one.
+
+Both foreground and background sessions deliver alerts to the active desktop user. Events that happen with no desktop user are skipped. In System Settings → Notifications, look for Script Editor or the sender macOS associates with AppleScript. Focus and the sender’s settings control banners and previews.
+
 ## Development and releases
 
 Install the Go version specified by `go.mod` and run `go test -race ./...` and `go vet ./...`. A canonical version tag triggers the release workflow, which publishes macOS Apple Silicon and Intel archives and `checksums.txt` after checks pass.
