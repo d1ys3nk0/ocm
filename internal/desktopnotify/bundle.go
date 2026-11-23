@@ -10,11 +10,12 @@ import (
 	"io/fs"
 )
 
-//go:embed native/*
-var native embed.FS
+//go:embed all:assets
+var assets embed.FS
 
 const BundleName = "OCM.app"
-const bundlePath = "/opt/ocm/" + BundleName
+const ApplicationsDir = "/Applications"
+const bundlePath = ApplicationsDir + "/" + BundleName
 
 type Resource struct {
 	Name string
@@ -30,9 +31,9 @@ func Resources() []Resource {
 }
 
 func Bundle() (map[string][]byte, error) {
-	data, err := native.ReadFile("native/notifier.zip")
+	data, err := assets.ReadFile("assets/notifier.zip")
 	if err != nil {
-		return nil, errors.New("native notification app missing from this build; use a release binary or run scripts/build-notifier.sh before building")
+		return nil, errors.New("native notification app missing from this build; use a release binary or run scripts/build-app.sh before building")
 	}
 	return readBundle(data)
 }

@@ -25,6 +25,10 @@ func installerFixture(t *testing.T) (installation, *[]string) {
 	write("source", 0755)
 	write("openconnect", 0755)
 	write("vpnc-script", 0644)
+	applicationsDir := filepath.Join(root, "Applications")
+	if err := os.Mkdir(applicationsDir, 0775); err != nil {
+		t.Fatal(err)
+	}
 	var calls []string
 	return installation{notificationBundle: func() (map[string][]byte, error) {
 		payload := make(map[string][]byte)
@@ -32,7 +36,7 @@ func installerFixture(t *testing.T) (installation, *[]string) {
 			payload[resource.Name] = []byte(resource.Name)
 		}
 		return payload, nil
-	}, packageDir: filepath.Join(root, "opt", "ocm"), dataDir: filepath.Join(root, "var", "lib", "ocm"), command: filepath.Join(root, "usr", "local", "bin", "ocm"), plist: filepath.Join(root, "Library", "LaunchDaemons", serviceLabel+".plist"), source: filepath.Join(root, "source"), openconnect: filepath.Join(root, "openconnect"), vendorHook: filepath.Join(root, "vpnc-script"), uid: os.Geteuid(), service: func(ctx context.Context, action, path string) error { calls = append(calls, action); return ctx.Err() }}, &calls
+	}, applicationsDir: applicationsDir, packageDir: filepath.Join(root, "opt", "ocm"), dataDir: filepath.Join(root, "var", "lib", "ocm"), command: filepath.Join(root, "usr", "local", "bin", "ocm"), plist: filepath.Join(root, "Library", "LaunchDaemons", serviceLabel+".plist"), source: filepath.Join(root, "source"), openconnect: filepath.Join(root, "openconnect"), vendorHook: filepath.Join(root, "vpnc-script"), uid: os.Geteuid(), service: func(ctx context.Context, action, path string) error { calls = append(calls, action); return ctx.Err() }}, &calls
 }
 
 func TestInstallDryRunIsNonMutating(t *testing.T) {
@@ -223,7 +227,7 @@ func TestInstallRejectsSymlinkedPrivateDirectory(t *testing.T) {
 func TestInstallResultSkipsIdenticalRegisteredService(t *testing.T) {
 	i, calls := installerFixture(t)
 	ctx := context.Background()
-	if result, err := i.installResult(ctx, true); err != nil || result != "would install" {
+	if result, err := i.installResult(ctx, true); err != nil || result != "would install app at "+i.appPath() {
 		t.Fatalf("unexpected preview %s: %v", result, err)
 	}
 	if result, err := i.installResult(ctx, false); err != nil || result != "installed" {
@@ -240,7 +244,7 @@ func TestInstallResultSkipsIdenticalRegisteredService(t *testing.T) {
 	}
 }
 
-func TestInstallRepairsMissingNotifierOnLegacyUpgrade(t *testing.T) {
+func TestInstallAddsAppToLegacyService(t *testing.T) {
 	i, _ := installerFixture(t)
 	ctx := context.Background()
 	if err := i.install(ctx, false); err != nil {
@@ -250,10 +254,10 @@ func TestInstallRepairsMissingNotifierOnLegacyUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := i.removeNotifier(); err != nil {
+	if err := removeApp(i.appPath()); err != nil {
 		t.Fatal(err)
 	}
-	record.Notifier = nil
+	record.Application = nil
 	data, err := json.Marshal(record)
 	if err != nil {
 		t.Fatal(err)
@@ -261,35 +265,101 @@ func TestInstallRepairsMissingNotifierOnLegacyUpgrade(t *testing.T) {
 	if err := os.WriteFile(i.recordPath(), data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if result, err := i.installResult(ctx, true); err != nil || result != "would install" {
+	if result, err := i.installResult(ctx, true); err != nil || result != "would install app at "+i.appPath() {
 		t.Fatalf("upgrade preview = %q, %v", result, err)
 	}
-	if _, err := os.Lstat(i.notifierPath()); !os.IsNotExist(err) {
+	if _, err := os.Lstat(i.appPath()); !os.IsNotExist(err) {
 		t.Fatalf("preview created a notification app: %v", err)
 	}
 	if result, err := i.installResult(ctx, false); err != nil || result != "installed" {
 		t.Fatalf("upgrade = %q, %v", result, err)
 	}
 	payload, err := i.notificationBundle()
-	if err != nil || !i.notifierMatches(payload) {
+	if err != nil || !i.appMatches(payload) {
 		t.Fatalf("signed resource payload was not installed: %v", err)
 	}
 	if err := i.uninstall(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(i.notifierPath()); !os.IsNotExist(err) {
+	if _, err := os.Stat(i.appPath()); !os.IsNotExist(err) {
 		t.Fatalf("uninstall retained the notification app: %v", err)
 	}
 }
 
-func TestInstallRefusesUnownedNotificationApp(t *testing.T) {
+func TestInstallRefusesUnownedAppInEitherLocation(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		i, _ := installerFixture(t)
+		path := i.appPath()
+		if legacy {
+			path = i.legacyAppPath()
+		}
+		if err := os.MkdirAll(path, 0755); err != nil {
+			t.Fatal(err)
+		}
+		for _, preview := range []bool{true, false} {
+			if err := i.install(context.Background(), preview); err == nil {
+				t.Fatalf("accepted an unowned app at %s", path)
+			}
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("changed the unowned app: %v", err)
+		}
+	}
+}
+
+func TestInstallMigratesManagedAppFromOpt(t *testing.T) {
 	i, _ := installerFixture(t)
-	if err := os.MkdirAll(i.notifierPath(), 0755); err != nil {
+	ctx := context.Background()
+	if err := i.install(ctx, false); err != nil {
 		t.Fatal(err)
 	}
-	for _, preview := range []bool{true, false} {
-		if err := i.install(context.Background(), preview); err == nil {
-			t.Fatal("accepted an unowned notification app")
+	record, _, err := i.inspect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(i.appPath(), i.legacyAppPath()); err != nil {
+		t.Fatal(err)
+	}
+	record.Notifier, record.Application = record.Application, nil
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(i.recordPath(), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	wantPreview := "would install app at " + i.appPath() + " and remove the managed app at " + i.legacyAppPath()
+	if result, err := i.installResult(ctx, true); err != nil || result != wantPreview {
+		t.Fatalf("migration preview = %q, %v", result, err)
+	}
+	if _, err := os.Stat(i.appPath()); !os.IsNotExist(err) {
+		t.Fatalf("preview created an app: %v", err)
+	}
+
+	originalService := i.service
+	startupError := errors.New("test startup failure")
+	i.service = func(ctx context.Context, action, path string) error {
+		if action == "start" {
+			return startupError
 		}
+		return originalService(ctx, action, path)
+	}
+	if err := i.install(ctx, false); !errors.Is(err, startupError) {
+		t.Fatalf("expected test startup failure, got %v", err)
+	}
+	if _, err := os.Stat(i.legacyAppPath()); err != nil {
+		t.Fatalf("failed upgrade removed legacy app: %v", err)
+	}
+
+	i.service = originalService
+	if result, err := i.installResult(ctx, false); err != nil || result != "installed" {
+		t.Fatalf("migration retry = %q, %v", result, err)
+	}
+	if _, err := os.Stat(i.legacyAppPath()); !os.IsNotExist(err) {
+		t.Fatalf("migration retained the legacy app: %v", err)
+	}
+	if result, err := i.installResult(ctx, false); err != nil || result != "unchanged" {
+		t.Fatalf("reinstall = %q, %v", result, err)
 	}
 }

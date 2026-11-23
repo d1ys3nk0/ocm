@@ -22,17 +22,18 @@ import (
 const serviceLabel = "io.github.d1ys3nk0.ocm"
 
 type installation struct {
-	notificationBundle                                                   func() (map[string][]byte, error)
-	packageDir, dataDir, command, plist, source, openconnect, vendorHook string
-	uid                                                                  int
-	service                                                              func(context.Context, string, string) error
+	notificationBundle                                                                    func() (map[string][]byte, error)
+	packageDir, applicationsDir, dataDir, command, plist, source, openconnect, vendorHook string
+	uid                                                                                   int
+	service                                                                               func(context.Context, string, string) error
 }
 
 type installRecord struct {
-	Notifier map[string][]string `json:"notifier,omitempty"`
-	Label    string              `json:"label"`
-	Binaries []string            `json:"binaries"`
-	Services []string            `json:"services"`
+	Application map[string][]string `json:"application,omitempty"`
+	Notifier    map[string][]string `json:"notifier,omitempty"`
+	Label       string              `json:"label"`
+	Binaries    []string            `json:"binaries"`
+	Services    []string            `json:"services"`
 }
 
 func systemInstallation() (installation, error) {
@@ -41,7 +42,7 @@ func systemInstallation() (installation, error) {
 	if runtime.GOARCH == "arm64" {
 		prefix = "/opt/homebrew"
 	}
-	return installation{notificationBundle: desktopnotify.Bundle, packageDir: "/opt/ocm", dataDir: "/var/lib/ocm", command: "/usr/local/bin/ocm", plist: "/Library/LaunchDaemons/" + serviceLabel + ".plist", source: source, openconnect: prefix + "/bin/openconnect", vendorHook: prefix + "/etc/vpnc/vpnc-script", uid: 0, service: launchService}, err
+	return installation{notificationBundle: desktopnotify.Bundle, applicationsDir: desktopnotify.ApplicationsDir, packageDir: "/opt/ocm", dataDir: "/var/lib/ocm", command: "/usr/local/bin/ocm", plist: "/Library/LaunchDaemons/" + serviceLabel + ".plist", source: source, openconnect: prefix + "/bin/openconnect", vendorHook: prefix + "/etc/vpnc/vpnc-script", uid: 0, service: launchService}, err
 }
 
 func launchService(ctx context.Context, action, plist string) error {
@@ -111,7 +112,7 @@ func (i installation) installResult(ctx context.Context, dryRun bool) (string, e
 				complete = false
 			}
 		}
-		if complete && i.notifierMatches(payload) {
+		if complete && i.appMatches(payload) && !i.hasLegacyApp() {
 			if err := i.service(ctx, "inspect", i.plist); err == nil {
 				return "unchanged", nil
 			} else if !errors.Is(err, fs.ErrNotExist) {
@@ -123,7 +124,11 @@ func (i installation) installResult(ctx context.Context, dryRun bool) (string, e
 		return "", err
 	}
 	if dryRun {
-		return "would install", nil
+		preview := "would install app at " + i.appPath()
+		if i.hasLegacyApp() {
+			preview += " and remove the managed app at " + i.legacyAppPath()
+		}
+		return preview, nil
 	}
 	return "installed", nil
 }
@@ -247,7 +252,7 @@ func (i installation) inspect() (installRecord, bool, error) {
 			}
 		}
 	}
-	if err := i.inspectNotifier(record); err != nil {
+	if err := i.inspectApps(record); err != nil {
 		return record, false, err
 	}
 	return record, owned, nil
@@ -440,7 +445,7 @@ func (i installation) install(ctx context.Context, dryRun bool) error {
 	if hash := hashBytes(plist); !slices.Contains(record.Services, hash) {
 		record.Services = append(record.Services, hash)
 	}
-	record.rememberNotifier(payload)
+	record.rememberApp(payload)
 	encoded, err := json.Marshal(record)
 	if err != nil {
 		return err
@@ -475,7 +480,7 @@ func (i installation) install(ctx context.Context, dryRun bool) error {
 	if err = i.service(ctx, "stop", i.plist); err != nil {
 		return err
 	}
-	if err = i.installNotifier(payload); err != nil {
+	if err = installApp(i.appPath(), payload); err != nil {
 		return err
 	}
 	if err = atomicInstall(i.binary(), data, 0755); err != nil {
@@ -493,7 +498,10 @@ func (i installation) install(ctx context.Context, dryRun bool) error {
 	if err = atomicInstall(i.plist, plist, 0644); err != nil {
 		return err
 	}
-	return i.service(ctx, "start", i.plist)
+	if err := i.service(ctx, "start", i.plist); err != nil {
+		return err
+	}
+	return removeApp(i.legacyAppPath())
 }
 
 func (i installation) uninstall(ctx context.Context) error {
@@ -508,7 +516,7 @@ func (i installation) uninstall(ctx context.Context) error {
 		return nil
 	}
 	installed := false
-	for _, path := range []string{i.packageDir, i.command, i.plist} {
+	for _, path := range []string{i.packageDir, i.appPath(), i.command, i.plist} {
 		if _, err := os.Lstat(path); err == nil {
 			installed = true
 		} else if !errors.Is(err, fs.ErrNotExist) {
@@ -538,8 +546,10 @@ func (i installation) uninstall(ctx context.Context) error {
 	if err = i.service(ctx, "stop", i.plist); err != nil {
 		return err
 	}
-	if err = i.removeNotifier(); err != nil {
-		return err
+	for _, path := range []string{i.appPath(), i.legacyAppPath()} {
+		if err := removeApp(path); err != nil {
+			return err
+		}
 	}
 	for _, path := range []string{i.command, i.hook(), i.binary(), i.plist, filepath.Join(i.packageDir, "bin"), i.packageDir} {
 		if err = os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {

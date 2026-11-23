@@ -60,4 +60,4 @@ jobs:
           version: v2.18.2
           args: release --snapshot --clean
       - name: Verify macOS snapshot archives
-        run: python3 scripts/check-release.py --notifier internal/desktopnotify/native/notifier.zip
+        run: python3 scripts/check-release.py --notifier internal/desktopnotify/assets/notifier.zip

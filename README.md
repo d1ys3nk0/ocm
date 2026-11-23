@@ -49,16 +49,16 @@ This interface replaces `connect NAME` with `run NAME` and the old `NAME start` 
 
 OCM posts macOS notifications when a tunnel connects, loses its connection, recovers, or disconnects. Each notification names the active profile. Connecting a different profile after stopping produces a disconnect for the old profile and a connect for the new one.
 
-Both foreground and background sessions deliver alerts to the active desktop user. Events that happen with no desktop user are skipped. The first alert asks macOS to allow notifications for **OCM**. To grant permission or send a test alert without changing the VPN session, run this as your desktop user:
+Both foreground and background sessions deliver alerts to the active desktop user. Events that happen with no desktop user are skipped. Open **OCM** from Applications to request notification permission. The first alert can also ask macOS to allow notifications for **OCM**. To grant permission or send a test alert without changing the VPN session, run this as your desktop user:
 
 ```sh
-open -n -a /opt/ocm/OCM.app --args --test
+open -n -a /Applications/OCM.app --args --test
 ```
 
 In System Settings → Notifications, select **OCM** to enable banners and Notification Center history. Focus and the sender’s settings control banner presentation and previews.
 
 ## Development and releases
 
-To build an installable executable from source on macOS, run `sh scripts/build-notifier.sh` before building the Go CLI. Normal Go tests can run without building the notifier.
+On macOS, `sh scripts/build-app.sh` builds the universal desktop app at `app/build/OCM.app`. To build an installable CLI from source, run the same command before building the Go executable so it embeds the signed app. Normal Go tests can run without building the notifier.
 
 Install the Go version specified by `go.mod` and run `go test -race ./...` and `go vet ./...`. A canonical version tag triggers the release workflow, which publishes macOS Apple Silicon and Intel archives and `checksums.txt` after checks pass.
