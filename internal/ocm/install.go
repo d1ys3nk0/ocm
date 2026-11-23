@@ -15,20 +15,24 @@ import (
 	"slices"
 	"syscall"
 	"time"
+
+	"github.com/d1ys3nk0/ocm/internal/desktopnotify"
 )
 
 const serviceLabel = "io.github.d1ys3nk0.ocm"
 
 type installation struct {
+	notificationBundle                                                   func() (map[string][]byte, error)
 	packageDir, dataDir, command, plist, source, openconnect, vendorHook string
 	uid                                                                  int
 	service                                                              func(context.Context, string, string) error
 }
 
 type installRecord struct {
-	Label    string   `json:"label"`
-	Binaries []string `json:"binaries"`
-	Services []string `json:"services"`
+	Notifier map[string][]string `json:"notifier,omitempty"`
+	Label    string              `json:"label"`
+	Binaries []string            `json:"binaries"`
+	Services []string            `json:"services"`
 }
 
 func systemInstallation() (installation, error) {
@@ -37,7 +41,7 @@ func systemInstallation() (installation, error) {
 	if runtime.GOARCH == "arm64" {
 		prefix = "/opt/homebrew"
 	}
-	return installation{packageDir: "/opt/ocm", dataDir: "/var/lib/ocm", command: "/usr/local/bin/ocm", plist: "/Library/LaunchDaemons/" + serviceLabel + ".plist", source: source, openconnect: prefix + "/bin/openconnect", vendorHook: prefix + "/etc/vpnc/vpnc-script", uid: 0, service: launchService}, err
+	return installation{notificationBundle: desktopnotify.Bundle, packageDir: "/opt/ocm", dataDir: "/var/lib/ocm", command: "/usr/local/bin/ocm", plist: "/Library/LaunchDaemons/" + serviceLabel + ".plist", source: source, openconnect: prefix + "/bin/openconnect", vendorHook: prefix + "/etc/vpnc/vpnc-script", uid: 0, service: launchService}, err
 }
 
 func launchService(ctx context.Context, action, plist string) error {
@@ -94,6 +98,10 @@ func (i installation) installResult(ctx context.Context, dryRun bool) (string, e
 		return "", err
 	}
 	if owned {
+		payload, err := i.notificationBundle()
+		if err != nil {
+			return "", err
+		}
 		source, sourceErr := os.ReadFile(i.source)
 		binary, binaryErr := os.ReadFile(i.binary())
 		plist, plistErr := os.ReadFile(i.plist)
@@ -103,7 +111,7 @@ func (i installation) installResult(ctx context.Context, dryRun bool) (string, e
 				complete = false
 			}
 		}
-		if complete {
+		if complete && i.notifierMatches(payload) {
 			if err := i.service(ctx, "inspect", i.plist); err == nil {
 				return "unchanged", nil
 			} else if !errors.Is(err, fs.ErrNotExist) {
@@ -225,7 +233,7 @@ func (i installation) inspect() (installRecord, bool, error) {
 	for _, dir := range []struct {
 		path  string
 		names []string
-	}{{i.packageDir, []string{"bin"}}, {filepath.Join(i.packageDir, "bin"), []string{"ocm", "ocm-hook"}}} {
+	}{{i.packageDir, []string{"bin", desktopnotify.BundleName}}, {filepath.Join(i.packageDir, "bin"), []string{"ocm", "ocm-hook"}}} {
 		entries, err := os.ReadDir(dir.path)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
@@ -238,6 +246,9 @@ func (i installation) inspect() (installRecord, bool, error) {
 				return record, false, fmt.Errorf("unrelated package resource: %s", filepath.Join(dir.path, entry.Name()))
 			}
 		}
+	}
+	if err := i.inspectNotifier(record); err != nil {
+		return record, false, err
 	}
 	return record, owned, nil
 }
@@ -369,6 +380,10 @@ func (i installation) install(ctx context.Context, dryRun bool) error {
 	if err := i.dependencies(); err != nil {
 		return err
 	}
+	payload, err := i.notificationBundle()
+	if err != nil {
+		return err
+	}
 	record, _, err := i.inspect()
 	if err != nil {
 		return err
@@ -425,6 +440,7 @@ func (i installation) install(ctx context.Context, dryRun bool) error {
 	if hash := hashBytes(plist); !slices.Contains(record.Services, hash) {
 		record.Services = append(record.Services, hash)
 	}
+	record.rememberNotifier(payload)
 	encoded, err := json.Marshal(record)
 	if err != nil {
 		return err
@@ -457,6 +473,9 @@ func (i installation) install(ctx context.Context, dryRun bool) error {
 		return err
 	}
 	if err = i.service(ctx, "stop", i.plist); err != nil {
+		return err
+	}
+	if err = i.installNotifier(payload); err != nil {
 		return err
 	}
 	if err = atomicInstall(i.binary(), data, 0755); err != nil {
@@ -517,6 +536,9 @@ func (i installation) uninstall(ctx context.Context) error {
 		return err
 	}
 	if err = i.service(ctx, "stop", i.plist); err != nil {
+		return err
+	}
+	if err = i.removeNotifier(); err != nil {
 		return err
 	}
 	for _, path := range []string{i.command, i.hook(), i.binary(), i.plist, filepath.Join(i.packageDir, "bin"), i.packageDir} {

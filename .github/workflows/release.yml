@@ -27,7 +27,7 @@ jobs:
     uses: ./.github/workflows/check.yml
   publish:
     needs: [validate-tag, check]
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     permissions:
       contents: write
     steps:

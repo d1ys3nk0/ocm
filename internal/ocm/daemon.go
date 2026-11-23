@@ -377,7 +377,7 @@ func Serve(ctx context.Context, root, hook string, transport Transport) error {
 		control.Close()
 		return err
 	}
-	notifications := desktopnotify.New("OCM")
+	notifications := desktopnotify.New()
 	defer notifications.Close()
 	d := daemon{ctx: ctx, root: root, hook: hook, run: transport.Run, notify: notifications.Notify, status: Status{State: "stopped", SavedProfile: saved}}
 	if saved != "" {
@@ -426,7 +426,7 @@ func Foreground(ctx context.Context, root, hook, name string, transport Transpor
 		ready <- err
 		return err
 	}
-	notifications := desktopnotify.New("OCM")
+	notifications := desktopnotify.New()
 	defer notifications.Close()
 	d := &daemon{ctx: ctx, root: root, hook: hook, run: transport.Run, notify: notifications.Notify, status: Status{State: "stopped"}, foreground: true}
 	return foregroundSession(ctx, d, name, ready)

@@ -1,6 +1,9 @@
 ---
 
 version: 2
+before:
+  hooks:
+    - sh scripts/build-notifier.sh
 builds:
   - main: ./cmd/ocm
     binary: ocm

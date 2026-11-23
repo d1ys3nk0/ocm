@@ -2,12 +2,15 @@ package ocm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"syscall"
 	"testing"
+
+	"github.com/d1ys3nk0/ocm/internal/desktopnotify"
 )
 
 func installerFixture(t *testing.T) (installation, *[]string) {
@@ -23,7 +26,13 @@ func installerFixture(t *testing.T) (installation, *[]string) {
 	write("openconnect", 0755)
 	write("vpnc-script", 0644)
 	var calls []string
-	return installation{packageDir: filepath.Join(root, "opt", "ocm"), dataDir: filepath.Join(root, "var", "lib", "ocm"), command: filepath.Join(root, "usr", "local", "bin", "ocm"), plist: filepath.Join(root, "Library", "LaunchDaemons", serviceLabel+".plist"), source: filepath.Join(root, "source"), openconnect: filepath.Join(root, "openconnect"), vendorHook: filepath.Join(root, "vpnc-script"), uid: os.Geteuid(), service: func(ctx context.Context, action, path string) error { calls = append(calls, action); return ctx.Err() }}, &calls
+	return installation{notificationBundle: func() (map[string][]byte, error) {
+		payload := make(map[string][]byte)
+		for _, resource := range desktopnotify.Resources() {
+			payload[resource.Name] = []byte(resource.Name)
+		}
+		return payload, nil
+	}, packageDir: filepath.Join(root, "opt", "ocm"), dataDir: filepath.Join(root, "var", "lib", "ocm"), command: filepath.Join(root, "usr", "local", "bin", "ocm"), plist: filepath.Join(root, "Library", "LaunchDaemons", serviceLabel+".plist"), source: filepath.Join(root, "source"), openconnect: filepath.Join(root, "openconnect"), vendorHook: filepath.Join(root, "vpnc-script"), uid: os.Geteuid(), service: func(ctx context.Context, action, path string) error { calls = append(calls, action); return ctx.Err() }}, &calls
 }
 
 func TestInstallDryRunIsNonMutating(t *testing.T) {
@@ -228,5 +237,59 @@ func TestInstallResultSkipsIdenticalRegisteredService(t *testing.T) {
 	}
 	if !reflect.DeepEqual((*calls)[before:], []string{"inspect", "inspect"}) {
 		t.Fatal("identical install restarted service")
+	}
+}
+
+func TestInstallRepairsMissingNotifierOnLegacyUpgrade(t *testing.T) {
+	i, _ := installerFixture(t)
+	ctx := context.Background()
+	if err := i.install(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	record, _, err := i.inspect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := i.removeNotifier(); err != nil {
+		t.Fatal(err)
+	}
+	record.Notifier = nil
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(i.recordPath(), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := i.installResult(ctx, true); err != nil || result != "would install" {
+		t.Fatalf("upgrade preview = %q, %v", result, err)
+	}
+	if _, err := os.Lstat(i.notifierPath()); !os.IsNotExist(err) {
+		t.Fatalf("preview created a notification app: %v", err)
+	}
+	if result, err := i.installResult(ctx, false); err != nil || result != "installed" {
+		t.Fatalf("upgrade = %q, %v", result, err)
+	}
+	payload, err := i.notificationBundle()
+	if err != nil || !i.notifierMatches(payload) {
+		t.Fatalf("signed resource payload was not installed: %v", err)
+	}
+	if err := i.uninstall(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(i.notifierPath()); !os.IsNotExist(err) {
+		t.Fatalf("uninstall retained the notification app: %v", err)
+	}
+}
+
+func TestInstallRefusesUnownedNotificationApp(t *testing.T) {
+	i, _ := installerFixture(t)
+	if err := os.MkdirAll(i.notifierPath(), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, preview := range []bool{true, false} {
+		if err := i.install(context.Background(), preview); err == nil {
+			t.Fatal("accepted an unowned notification app")
+		}
 	}
 }

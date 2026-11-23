@@ -39,7 +39,7 @@ jobs:
           cache: false
       - run: go run github.com/zricethezav/gitleaks/v8@v8.30.0 git --redact --no-banner .
   packaging:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -60,4 +60,4 @@ jobs:
           version: v2.18.2
           args: release --snapshot --clean
       - name: Verify macOS snapshot archives
-        run: python3 scripts/check-release.py
+        run: python3 scripts/check-release.py --notifier internal/desktopnotify/native/notifier.zip

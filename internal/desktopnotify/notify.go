@@ -11,10 +11,6 @@ import (
 	"time"
 )
 
-const script = `on run argv
-    display notification (item 2 of argv) with title (item 1 of argv)
-end run`
-
 const deliveryTimeout = 3 * time.Second
 
 type message struct {
@@ -30,10 +26,8 @@ type Notifier struct {
 }
 
 // New starts an independent delivery worker. Network operations never wait for it.
-func New(title string) *Notifier {
-	return newNotifier(consoleUID, func(ctx context.Context, uid int, body string) {
-		deliver(ctx, uid, title, body)
-	})
+func New() *Notifier {
+	return newNotifier(consoleUID, deliver)
 }
 
 func newNotifier(user func() int, send func(context.Context, int, string)) *Notifier {
@@ -101,15 +95,15 @@ func consoleUID() int {
 	return int(stat.Uid)
 }
 
-func deliver(ctx context.Context, uid int, title, body string) {
+func deliver(ctx context.Context, uid int, body string) {
 	id := strconv.Itoa(uid)
 	if command(ctx, "/bin/launchctl", "print", "gui/"+id).Run() != nil || consoleUID() != uid {
 		return
 	}
 	// asuser enters the GUI bootstrap context without dropping root credentials.
-	// sudo drops them before invoking the script.
+	// sudo drops them before Launch Services opens the app.
 	_ = command(ctx, "/bin/launchctl", "asuser", id, "/usr/bin/sudo", "-n", "-H",
-		"-u", "#"+id, "--", "/usr/bin/osascript", "-e", script, title, body).Run()
+		"-u", "#"+id, "--", "/usr/bin/open", "-g", "-j", "-n", "-a", bundlePath, "--args", "--notify", body).Run()
 }
 
 func command(ctx context.Context, path string, args ...string) *exec.Cmd {

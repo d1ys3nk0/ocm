@@ -12,7 +12,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", type=Path, default=Path("dist"))
     parser.add_argument("--version", help="Require this release version in both archive names")
+    parser.add_argument("--notifier", type=Path, help="Require this signed notifier bundle in both executables")
     args = parser.parse_args()
+    notifier = args.notifier.read_bytes() if args.notifier else None
     dist = args.directory
     archives = sorted(dist.glob("*.tar.gz"))
     targets = {"darwin_amd64": 0x01000007, "darwin_arm64": 0x0100000C}
@@ -54,6 +56,8 @@ def main():
             binary = contents.extractfile(executable).read()
             if len(binary) < 8 or struct.unpack("<II", binary[:8]) != (0xFEEDFACF, targets[target]):
                 raise ValueError(f"Unexpected Mach-O architecture: {archive.name}")
+            if notifier is not None and (not notifier or notifier not in binary):
+                raise ValueError(f"Missing signed notification app: {archive.name}")
 
     if found != set(targets) or len(versions) != 1:
         raise ValueError("Archive platforms or versions disagree")
