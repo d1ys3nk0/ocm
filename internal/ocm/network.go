@@ -14,6 +14,10 @@ const systemPath = "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
 func systemCommand(ctx context.Context, input, path string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	return runSystemCommand(ctx, input, path, args...)
+}
+
+func runSystemCommand(ctx context.Context, input, path string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Env = []string{systemPath, "LC_ALL=C"}
 	cmd.Stdin = strings.NewReader(input)

@@ -92,21 +92,31 @@ func (t Transport) cleanup(ctx context.Context) error {
 	return t.recoverNetwork(ctx)
 }
 
-func (t Transport) ready(ctx context.Context) bool {
-	data, err := os.ReadFile(filepath.Join(t.Root, "tunnel"))
+func (t Transport) ready(ctx context.Context) tunnelLink {
+	file, err := os.Open(filepath.Join(t.Root, "tunnel"))
 	if err != nil {
-		return false
+		return tunnelLink{}
 	}
-	name := strings.TrimSpace(string(data))
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return tunnelLink{}
+	}
+	var data [32]byte
+	n, _ := file.Read(data[:])
+	name := strings.TrimSpace(string(data[:n]))
 	if !tunnelDevice.MatchString(name) {
-		return false
+		return tunnelLink{}
 	}
 	output, err := systemCommand(ctx, "", "/sbin/ifconfig", name)
-	return err == nil && strings.Contains(output, "\tinet ")
+	if err != nil || !strings.Contains(output, "\tinet ") {
+		return tunnelLink{}
+	}
+	return tunnelLink{device: name, marker: info}
 }
 
-func (t Transport) Run(ctx context.Context, profile Profile, status func(string)) (result error) {
-	status("waiting-network")
+func (t Transport) Run(ctx context.Context, profile Profile, status func(state, health string)) (result error) {
+	status("waiting-network", "")
 	var network string
 	for ctx.Err() == nil {
 		network = uplink(ctx)
@@ -124,7 +134,7 @@ func (t Transport) Run(ctx context.Context, profile Profile, status func(string)
 		return fmt.Errorf("%w: %v", errRecovery, err)
 	}
 	os.Remove(filepath.Join(t.Root, "tunnel"))
-	status("connecting")
+	status("connecting", "")
 	path := filepath.Join(t.Root, "openconnect.log")
 	if err := os.Rename(path, path+".previous"); err != nil && !os.IsNotExist(err) {
 		return err
@@ -159,11 +169,23 @@ func (t Transport) Run(ctx context.Context, profile Profile, status func(string)
 		}
 		result = errors.Join(result, finishErr)
 	}()
-	started := time.Now()
-	lastSample := started
-	lastNetwork := started
-	reconnecting := time.Time{}
-	connected := false
+	watch := newTunnelWatch(time.Now(), network, tunnelHealth{policy: profile.health, ping: t.ping})
+	defer func() {
+		watch.health.reset()
+		if result := watch.health.pending.result; result != nil {
+			<-result
+		}
+	}()
+	reconnect := func(ctx context.Context) error {
+		if err := t.restoreDNS(ctx); err != nil {
+			return err
+		}
+		os.Remove(filepath.Join(t.Root, "tunnel"))
+		if err := cmd.Process.Signal(syscall.SIGUSR2); err != nil {
+			return fmt.Errorf("cannot request OpenConnect reconnect: %w", err)
+		}
+		return nil
+	}
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
@@ -185,47 +207,8 @@ func (t Transport) Run(ctx context.Context, profile Profile, status func(string)
 			if authError.MatchString(log) {
 				return errAuthentication
 			}
-			ready := t.ready(ctx)
-			if ready && !connected {
-				connected = true
-				status("connected")
-			}
-			if !connected && now.Sub(started) > 40*time.Second {
-				return fmt.Errorf("OpenConnect tunnel did not become ready")
-			}
-			if !connected {
-				continue
-			}
-			failed := connectionError.FindAllStringIndex(log, -1)
-			ok := established.FindAllStringIndex(log, -1)
-			unhealthy := !ready || (len(failed) > 0 && (len(ok) == 0 || failed[len(failed)-1][0] > ok[len(ok)-1][0]))
-			if !reconnecting.IsZero() && now.Sub(reconnecting) > 12*time.Second {
-				return fmt.Errorf("OpenConnect did not recover after uplink change")
-			}
-			awake := now.Unix()-lastSample.Unix() > 20
-			lastSample = now
-			if now.Sub(lastNetwork) < 5*time.Second && !awake && !unhealthy {
-				continue
-			}
-			lastNetwork = now
-			current := uplink(ctx)
-			if current == "" {
-				return fmt.Errorf("physical uplink unavailable")
-			}
-			if reconnecting.IsZero() && reconnectNeeded(network, current, awake, unhealthy) {
-				network = current
-				if err := t.restoreDNS(ctx); err != nil {
-					return err
-				}
-				os.Remove(filepath.Join(t.Root, "tunnel"))
-				if err := cmd.Process.Signal(syscall.SIGUSR2); err != nil {
-					return fmt.Errorf("cannot request OpenConnect reconnect: %w", err)
-				}
-				reconnecting = now
-				status("reconnecting")
-			} else if !reconnecting.IsZero() && !unhealthy {
-				reconnecting = time.Time{}
-				status("connected")
+			if err := watch.sample(ctx, now, t.ready(ctx), log, uplink, reconnect, status); err != nil {
+				return err
 			}
 		}
 	}

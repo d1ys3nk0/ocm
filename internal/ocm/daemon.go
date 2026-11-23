@@ -26,6 +26,7 @@ type Status struct {
 	Profile      string `json:"profile,omitempty"`
 	SavedProfile string `json:"saved_profile,omitempty"`
 	Error        string `json:"error,omitempty"`
+	health       string
 }
 
 func (s Status) MarshalJSON() ([]byte, error) {
@@ -49,7 +50,10 @@ func (s Status) MarshalJSON() ([]byte, error) {
 		mode = "foreground"
 	}
 	message := s.Error
-	health := "unknown"
+	health := s.health
+	if health == "" {
+		health = "unknown"
+	}
 	if state == "failed" {
 		health = "unhealthy"
 	}
@@ -69,7 +73,7 @@ func (s Status) MarshalJSON() ([]byte, error) {
 	}{state, mode, s.Profile, s.SavedProfile, health, message, map[string]string{"stage": s.State}})
 }
 
-type runner func(context.Context, Profile, func(string)) error
+type runner func(context.Context, Profile, func(state, health string)) error
 
 type daemon struct {
 	ctx        context.Context
@@ -99,10 +103,11 @@ func (d *daemon) snapshot() Status {
 	return d.status
 }
 
-func (d *daemon) setState(state string) {
+func (d *daemon) setState(state, health string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.status.State = state
+	d.status.health = health
 	if state == "connecting" {
 		d.status.Error = ""
 	}
@@ -124,6 +129,7 @@ func (d *daemon) stopWorker() error {
 	d.status.Profile = ""
 	d.status.State = "stopped"
 	d.status.Error = ""
+	d.status.health = ""
 	d.mu.Unlock()
 	return nil
 }
@@ -135,6 +141,7 @@ func (d *daemon) launch(name string, persistent bool) <-chan struct{} {
 	d.mu.Lock()
 	d.status.Profile = name
 	d.status.State = "waiting-network"
+	d.status.health = ""
 	d.mu.Unlock()
 	session := d.session
 	d.session = nil
@@ -164,15 +171,15 @@ func (d *daemon) launch(name string, persistent bool) <-chan struct{} {
 		for ctx.Err() == nil {
 			profile, err := d.loadProfile(name)
 			if err != nil {
-				d.setState("profile-unavailable")
+				d.setState("profile-unavailable", "")
 				if !persistent || !pause(ctx, delay) {
 					return
 				}
 				delay = min(delay*2, 5*time.Minute)
 				continue
 			}
-			err = d.run(ctx, profile, func(state string) {
-				d.setState(state)
+			err = d.run(ctx, profile, func(state, health string) {
+				d.setState(state, health)
 				if ctx.Err() != nil {
 					return
 				}
@@ -200,17 +207,17 @@ func (d *daemon) launch(name string, persistent bool) <-chan struct{} {
 					d.mu.Unlock()
 					fmt.Fprintln(os.Stderr, "ocm:", err)
 				} else {
-					d.setState("stopped")
+					d.setState("stopped", "")
 				}
 				return
 			}
 			lost()
 			if errors.Is(err, errAuthentication) {
-				d.setState("authentication-required")
+				d.setState("authentication-required", "")
 				return
 			}
 			if err == nil {
-				d.setState("stopped")
+				d.setState("stopped", "")
 			} else {
 				d.mu.Lock()
 				d.status.State = "failed"

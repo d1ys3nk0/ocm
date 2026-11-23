@@ -40,8 +40,8 @@ func TestSavedProfileSurvivesDaemonRestartAndStopCancels(t *testing.T) {
 				}
 				return Profile{}, nil
 			},
-			run: func(ctx context.Context, _ Profile, state func(string)) error {
-				state("connecting")
+			run: func(ctx context.Context, _ Profile, state func(string, string)) error {
+				state("connecting", "")
 				close(started)
 				<-ctx.Done()
 				close(cancelled)
@@ -82,7 +82,7 @@ func TestForegroundDoesNotPersistAndAuthFailureStopsRetry(t *testing.T) {
 	d := &daemon{
 		ctx: context.Background(), root: root, status: Status{State: "stopped"},
 		load: func(string) (Profile, error) { return Profile{}, nil },
-		run:  func(context.Context, Profile, func(string)) error { return errAuthentication },
+		run:  func(context.Context, Profile, func(string, string)) error { return errAuthentication },
 	}
 	_, done, err := d.handle(Request{Action: "run", Profile: "office"})
 	if err != nil {
@@ -111,8 +111,8 @@ func TestStartAndToggleRequireStoppingBeforeProfileChange(t *testing.T) {
 	d := &daemon{
 		ctx: context.Background(), root: root, status: Status{State: "stopped"},
 		load: func(string) (Profile, error) { return Profile{}, nil },
-		run: func(ctx context.Context, _ Profile, state func(string)) error {
-			state("connecting")
+		run: func(ctx context.Context, _ Profile, state func(string, string)) error {
+			state("connecting", "")
 			started <- struct{}{}
 			<-ctx.Done()
 			return ctx.Err()
@@ -189,12 +189,12 @@ func TestForegroundSocketAndExclusiveSession(t *testing.T) {
 				ctx: ctx, root: root, foreground: true, status: Status{State: "stopped"},
 				notify: func(body string) { alerts = append(alerts, body) },
 				load:   func(string) (Profile, error) { return Profile{}, nil },
-				run: func(ctx context.Context, _ Profile, state func(string)) error {
-					state("connected")
-					state("connected")
-					state("reconnecting")
-					state("reconnecting")
-					state("connected")
+				run: func(ctx context.Context, _ Profile, state func(string, string)) error {
+					state("connected", "")
+					state("connected", "")
+					state("reconnecting", "")
+					state("reconnecting", "")
+					state("connected", "")
 					close(started)
 					<-ctx.Done()
 					return ctx.Err()
@@ -263,7 +263,7 @@ func TestFailedRecoveryReportedByStop(t *testing.T) {
 	d := &daemon{
 		ctx: context.Background(), root: root, status: Status{State: "stopped"},
 		load: func(string) (Profile, error) { return Profile{}, nil },
-		run: func(ctx context.Context, _ Profile, _ func(string)) error {
+		run: func(ctx context.Context, _ Profile, _ func(string, string)) error {
 			close(started)
 			<-ctx.Done()
 			return errors.Join(ctx.Err(), errRecovery)
@@ -290,7 +290,7 @@ func TestStopReportsRecoveryFailureDuringRetry(t *testing.T) {
 	d := &daemon{
 		ctx: context.Background(), root: root, status: Status{State: "stopped"},
 		load: func(string) (Profile, error) { return Profile{}, nil },
-		run: func(context.Context, Profile, func(string)) error {
+		run: func(context.Context, Profile, func(string, string)) error {
 			close(attempt)
 			return errRecovery
 		},
@@ -372,16 +372,16 @@ func TestBackgroundNotificationsAcrossAutomaticRetry(t *testing.T) {
 			ctx: ctx, root: root, status: Status{State: "stopped"},
 			load:   func(string) (Profile, error) { return Profile{}, nil },
 			notify: func(body string) { alerts <- body },
-			run: func(ctx context.Context, _ Profile, state func(string)) error {
+			run: func(ctx context.Context, _ Profile, state func(string, string)) error {
 				attempts++
 				if attempts == 1 {
-					state("connected")
+					state("connected", "")
 					return errors.New("unexpected exit")
 				}
 				if attempts == 2 {
 					return errors.New("still unavailable")
 				}
-				state("connected")
+				state("connected", "")
 				<-ctx.Done()
 				return ctx.Err()
 			},

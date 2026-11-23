@@ -20,6 +20,7 @@ type Profile struct {
 	password string
 	args     []string
 	dns      dnsPolicy
+	health   pingPolicy
 }
 
 func LoadProfile(root, name, hook string) (Profile, error) {
@@ -131,5 +132,9 @@ func parseProfile(scanner *bufio.Scanner, hook string) (Profile, error) {
 	if err != nil {
 		return Profile{}, err
 	}
-	return Profile{password: values["OC_PASS"], args: append(args, "--", host), dns: dns}, nil
+	health, err := parsePingPolicy(values)
+	if err != nil {
+		return Profile{}, err
+	}
+	return Profile{password: values["OC_PASS"], args: append(args, "--", host), dns: dns, health: health}, nil
 }
