@@ -18,6 +18,7 @@ func ValidProfileName(name string) bool { return profileName.MatchString(name) }
 
 type Profile struct {
 	password string
+	hostname string
 	args     []string
 	dns      dnsPolicy
 	health   pingPolicy
@@ -136,5 +137,5 @@ func parseProfile(scanner *bufio.Scanner, hook string) (Profile, error) {
 	if err != nil {
 		return Profile{}, err
 	}
-	return Profile{password: values["OC_PASS"], args: append(args, "--", host), dns: dns, health: health}, nil
+	return Profile{hostname: server.Hostname(), password: values["OC_PASS"], args: append(args, "--", host), dns: dns, health: health}, nil
 }

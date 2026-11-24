@@ -26,7 +26,7 @@ OC_DNS_DOMAINS=corp.example.com,internal.example.net
 OC_DNS_SERVER=192.0.2.53
 ```
 
-Profiles without DNS suffixes leave DNS alone. OCM installs supplemental resolver files while connected and removes its files during disconnect and recovery. An existing resolver file for a requested suffix prevents setup.
+Profiles without DNS suffixes leave DNS alone. OCM installs supplemental resolver files while connected and removes its files during disconnect and recovery. An existing resolver file for a requested suffix prevents setup. When a suffix also covers the VPN gateway, OCM looks up the gateway through the physical network's DNS before each OpenConnect launch. It passes the address to OpenConnect while retaining the original hostname for TLS verification. If the lookup fails, status reports the `gateway-dns-failed` stage and the private service log records the lookup details.
 
 To verify connectivity through the VPN, add a ping check to the profile.
 

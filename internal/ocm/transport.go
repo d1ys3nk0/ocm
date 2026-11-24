@@ -135,6 +135,10 @@ func (t Transport) Run(ctx context.Context, profile Profile, status func(state, 
 	}
 	os.Remove(filepath.Join(t.Root, "tunnel"))
 	status("connecting", "")
+	args, err := t.gatewayArgs(ctx, profile, strings.SplitN(network, "/", 2)[0])
+	if err != nil {
+		return err
+	}
 	path := filepath.Join(t.Root, "openconnect.log")
 	if err := os.Rename(path, path+".previous"); err != nil && !os.IsNotExist(err) {
 		return err
@@ -144,7 +148,7 @@ func (t Transport) Run(ctx context.Context, profile Profile, status func(state, 
 		return err
 	}
 	defer log.Close()
-	cmd := exec.Command(t.OpenConnect, profile.args...)
+	cmd := exec.Command(t.OpenConnect, args...)
 	cmd.Env = []string{systemPath, "LC_ALL=C", "HOME=/var/root",
 		"OC_DNS_DOMAINS=" + strings.Join(profile.dns.domains, ","), "OC_DNS_SERVER=" + profile.dns.server}
 	cmd.Stdin = strings.NewReader(profile.password + "\n")

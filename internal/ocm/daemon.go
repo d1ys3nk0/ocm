@@ -29,6 +29,15 @@ type Status struct {
 	health       string
 }
 
+func (s Status) failed() bool {
+	switch s.State {
+	case "failed", "authentication-required", "gateway-dns-failed":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s Status) MarshalJSON() ([]byte, error) {
 	state := "stopped"
 	switch s.State {
@@ -38,7 +47,7 @@ func (s Status) MarshalJSON() ([]byte, error) {
 		state = "running"
 	case "reconnecting", "profile-unavailable":
 		state = "recovering"
-	case "failed", "authentication-required":
+	case "failed", "authentication-required", "gateway-dns-failed":
 		state = "failed"
 	case "stopping":
 		state = "stopping"
@@ -59,6 +68,8 @@ func (s Status) MarshalJSON() ([]byte, error) {
 	}
 	if message == "" && s.State == "authentication-required" {
 		message = "authentication required"
+	} else if message == "" && s.State == "gateway-dns-failed" {
+		message = errGatewayDNS.Error()
 	} else if message == "" && s.State == "failed" {
 		message = "session failed; check private logs"
 	}
@@ -218,6 +229,9 @@ func (d *daemon) launch(name string, persistent bool) <-chan struct{} {
 			}
 			if err == nil {
 				d.setState("stopped", "")
+			} else if errors.Is(err, errGatewayDNS) {
+				d.setState("gateway-dns-failed", "")
+				fmt.Fprintln(os.Stderr, "ocm:", err)
 			} else {
 				d.mu.Lock()
 				d.status.State = "failed"
@@ -246,7 +260,7 @@ func (d *daemon) handle(req Request) (Status, <-chan struct{}, error) {
 		return Status{}, nil, d.ctx.Err()
 	}
 	current := d.snapshot()
-	if d.foreground && (req.Action == "start" || req.Action == "toggle" && (current.Profile == "" || current.State == "stopped" || current.State == "failed" || current.State == "authentication-required")) {
+	if d.foreground && (req.Action == "start" || req.Action == "toggle" && (current.Profile == "" || current.State == "stopped" || current.failed())) {
 		return Status{}, nil, fmt.Errorf("foreground session is ending; retry the command")
 	}
 	switch req.Action {
@@ -254,7 +268,7 @@ func (d *daemon) handle(req Request) (Status, <-chan struct{}, error) {
 		if !profileName.MatchString(req.Profile) {
 			return Status{}, nil, fmt.Errorf("invalid profile name")
 		}
-		if current.SavedProfile != "" || (current.Profile != "" && current.State != "stopped" && current.State != "failed" && current.State != "authentication-required") {
+		if current.SavedProfile != "" || (current.Profile != "" && current.State != "stopped" && !current.failed()) {
 			if current.SavedProfile != "" && current.SavedProfile != req.Profile || current.Profile != "" && current.Profile != req.Profile {
 				return Status{}, nil, fmt.Errorf("stop the existing session before changing profiles")
 			}
@@ -271,17 +285,17 @@ func (d *daemon) handle(req Request) (Status, <-chan struct{}, error) {
 			return Status{}, nil, err
 		}
 	}
-	if req.Action == "run" && (current.SavedProfile != "" || (current.Profile != "" && current.State != "stopped" && current.State != "failed" && current.State != "authentication-required")) {
+	if req.Action == "run" && (current.SavedProfile != "" || (current.Profile != "" && current.State != "stopped" && !current.failed())) {
 		return Status{}, nil, fmt.Errorf("stop the existing session before foreground run")
 	}
 	if req.Action == "start" {
 		if current.SavedProfile != "" && current.SavedProfile != req.Profile || current.Profile != "" && current.Profile != req.Profile && current.State != "stopped" {
 			return Status{}, nil, fmt.Errorf("stop the existing session before changing profiles")
 		}
-		if current.SavedProfile == req.Profile && current.State != "failed" && current.State != "authentication-required" && current.State != "stopped" {
+		if current.SavedProfile == req.Profile && !current.failed() && current.State != "stopped" {
 			return current, nil, nil
 		}
-		if current.SavedProfile == "" && current.Profile != "" && current.State != "stopped" && current.State != "failed" && current.State != "authentication-required" {
+		if current.SavedProfile == "" && current.Profile != "" && current.State != "stopped" && !current.failed() {
 			return Status{}, nil, fmt.Errorf("stop the foreground session before starting in the background")
 		}
 	}
@@ -493,6 +507,8 @@ func foregroundSession(ctx context.Context, d *daemon, name string, ready chan<-
 		return ctx.Err()
 	case <-done:
 		switch d.snapshot().State {
+		case "gateway-dns-failed":
+			return errGatewayDNS
 		case "failed", "authentication-required", "profile-unavailable":
 			return fmt.Errorf("foreground session failed; check private logs")
 		}
